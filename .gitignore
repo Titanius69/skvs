@@ -1,0 +1,41 @@
+# --- Rust ---
+/target/
+Cargo.lock
+*.pdb
+
+# --- Node.js ---
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+pnpm-lock.yaml
+yarn.lock
+
+# --- Native addon build output ---
+*.node
+*.so
+*.dylib
+*.dll
+
+# --- Secrets / local config ---
+.env
+.env.*
+config.toml
+!config.example.toml
+
+# --- Runtime data ---
+data/
+*.wal
+wal.bin
+/var/lib/skvs/
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# --- Logs ---
+*.log

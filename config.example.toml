@@ -1,0 +1,33 @@
+[server]
+id = 1
+replication_port = 9999
+
+[peer]
+address = "192.168.1.10:9999"
+
+[storage]
+base_dir = "/var/lib/skvs"
+
+[wal]
+flush_interval_secs = 1
+batch_size = 1000
+
+[http]
+port = 3000
+trusted_ips = ["127.0.0.1", "::1", "192.168.1.0/24"]
+secret_key = "your-super-secret-key-123"
+
+[[databases]]
+id = 0
+name = "default"
+
+[[databases]]
+id = 1
+name = "user_data"
+
+# Optional: when a raw KV table grows past this many in-memory entries, the
+# oldest-seen entries spill to disk under {storage.base_dir}/overflow/ and are
+# still readable (just a bit slower) instead of growing memory forever.
+# Leaving this section out, or setting it to 0, disables the behavior.
+[memory]
+max_entries_per_table = 0
