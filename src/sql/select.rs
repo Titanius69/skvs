@@ -51,9 +51,11 @@ pub fn execute_select(
         }
 
         if let Some(where_expr) = &select.selection {
-            let mut idx = 0usize;
             rows = rows.into_iter()
-                .filter(|row| evaluate_where_ctx(state, db_id, row, where_expr, params, &mut idx))
+                .filter(|row| {
+                    let mut idx = 0usize;
+                    evaluate_where_ctx(state, db_id, row, where_expr, params, &mut idx)
+                })
                 .collect();
         }
 
@@ -77,9 +79,11 @@ pub fn execute_select(
         rows = execute_joins(state, db_id, &select.from, params)?;
 
         if let Some(where_expr) = &select.selection {
-            let mut idx = 0usize;
             rows = rows.into_iter()
-                .filter(|row| evaluate_where_ctx(state, db_id, row, where_expr, params, &mut idx))
+                .filter(|row| {
+                    let mut idx = 0usize;
+                    evaluate_where_ctx(state, db_id, row, where_expr, params, &mut idx)
+                })
                 .collect();
         }
 
