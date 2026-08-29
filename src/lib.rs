@@ -52,6 +52,10 @@ pub fn init(config_path: Option<String>) -> Result<()> {
         &format!("{}/overflow", config.storage.base_dir),
     ));
 
+    // Restore any SQL-table data (INSERT/UPDATE/etc. via query()) that was snapshotted to
+    // disk on a previous run, before anything starts serving requests.
+    WalWriter::load_snapshot(&state, &config);
+
     let wal = Arc::new(WalWriter::new(state.clone(), &config));
     wal.start(RUNTIME.get().unwrap());
 

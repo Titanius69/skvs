@@ -105,11 +105,25 @@ pub fn execute_update(
         let mut affected = 0u64;
         let mut rows_to_update = Vec::new();
 
+        // `params` is one flat list of `?` values in left-to-right textual order:
+        // first every placeholder in the SET assignments, then every placeholder in
+        // the WHERE clause. The WHERE clause must therefore start reading `params`
+        // *after* skipping however many placeholders the assignments consume -
+        // starting it at 0 (as if WHERE had its own private params array) makes it
+        // silently read values meant for SET, so a WHERE like `uuid = ?` ends up
+        // comparing the uuid column against whatever the first SET value was. That
+        // reliably never matches, and every caller doing a compare-and-swap style
+        // `UPDATE ... SET x = ? WHERE id = ? AND version = ?` would see 0 affected
+        // rows on every attempt, indistinguishable from constant write contention.
+        let set_param_count: usize = assignments.iter()
+            .map(|assignment| count_placeholders(&assignment.value))
+            .sum();
+
         // Collect rows
         for entry in store.iter() {
             let rowid = *entry.key();
             let row = entry.value();
-            let mut where_param_idx = 0usize;
+            let mut where_param_idx = set_param_count;
             let matches = match selection {
                 Some(where_expr) => evaluate_where(row, where_expr, params, &mut where_param_idx),
                 None => true,
@@ -218,6 +232,23 @@ pub fn execute_delete(
     }
 }
 
+/// Counts how many `?` placeholders an expression consumes, without needing
+/// any actual param values. Used to figure out where in the flat `params`
+/// list a later, independent expression (e.g. a WHERE clause following a
+/// SET list) should start reading from. Must walk exactly the same node
+/// types `evaluate_expr` recurses into, or the two will disagree about how
+/// many placeholders were consumed.
+fn count_placeholders(expr: &Expr) -> usize {
+    match expr {
+        Expr::Value(SqlValue::Placeholder(_)) => 1,
+        Expr::Value(_) => 0,
+        Expr::UnaryOp { expr, .. } => count_placeholders(expr),
+        Expr::Nested(inner) => count_placeholders(inner),
+        Expr::BinaryOp { left, right, .. } => count_placeholders(left) + count_placeholders(right),
+        _ => 0,
+    }
+}
+
 /// Evaluate a scalar expression down to a stored `Value`, substituting `?`
 /// placeholders from `params` in left-to-right order.
 pub fn evaluate_expr(expr: &Expr, params: &[Value], param_idx: &mut usize) -> Result<Value, SkvsError> {
@@ -275,6 +306,81 @@ fn sync_fts_index(state: &KvsState, db_id: u32, table: &str, rowid: RowId, row: 
         Err(_) => {
             let rt = tokio::runtime::Runtime::new().expect("failed to create runtime");
             rt.block_on(fut);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::DatabaseConfig;
+    use crate::state::KvsState;
+    use crate::sql::SqlEngine;
+
+    fn new_state() -> KvsState {
+        KvsState::new(&[DatabaseConfig { id: 0, name: "default".into() }])
+    }
+
+    /// Reproduces the SkvsInventory CAS pattern: an UPDATE whose SET list has
+    /// placeholders that come *before* the WHERE clause's own placeholders in
+    /// the flat params list. Before the fix, the WHERE clause read `params[0]`
+    /// (meant for the first SET value) instead of its own uuid/timestamp
+    /// params, so this update would always affect 0 rows no matter what was
+    /// actually stored.
+    #[test]
+    fn update_where_reads_its_own_params_not_the_sets() {
+        let state = new_state();
+
+        SqlEngine::execute(
+            &state, 0,
+            "CREATE TABLE t (uuid TEXT PRIMARY KEY, inventory TEXT, updated_at INTEGER)",
+            &[], None,
+        ).unwrap();
+
+        SqlEngine::execute(
+            &state, 0,
+            "INSERT INTO t (uuid, inventory, updated_at) VALUES (?, ?, ?)",
+            &[Value::Text("abc-123".into()), Value::Text("old".into()), Value::Integer(100)],
+            None,
+        ).unwrap();
+
+        // SET updated_at=?, inventory=?  WHERE uuid=? AND updated_at<=?
+        let result = SqlEngine::execute(
+            &state, 0,
+            "UPDATE t SET updated_at = ?, inventory = ? WHERE uuid = ? AND updated_at <= ?",
+            &[
+                Value::Integer(200),                 // SET updated_at
+                Value::Text("new".into()),            // SET inventory
+                Value::Text("abc-123".into()),        // WHERE uuid
+                Value::Integer(100),                  // WHERE updated_at <=
+            ],
+            None,
+        ).unwrap();
+
+        assert_eq!(result.affected_rows, Some(1), "CAS update should match the existing row");
+
+        let rows = SqlEngine::execute(
+            &state, 0,
+            "SELECT inventory, updated_at FROM t WHERE uuid = ?",
+            &[Value::Text("abc-123".into())],
+            None,
+        ).unwrap();
+        assert_eq!(rows.rows[0].get("inventory"), Some(&Value::Text("new".into())));
+        assert_eq!(rows.rows[0].get("updated_at"), Some(&Value::Integer(200)));
+    }
+
+    #[test]
+    fn count_placeholders_matches_evaluate_expr_consumption() {
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+
+        let dialect = GenericDialect {};
+        let stmts = Parser::parse_sql(&dialect, "UPDATE t SET a = ?, b = ? WHERE id = ?").unwrap();
+        if let Statement::Update { assignments, .. } = &stmts[0] {
+            let total: usize = assignments.iter().map(|a| count_placeholders(&a.value)).sum();
+            assert_eq!(total, 2);
+        } else {
+            panic!("expected UPDATE statement");
         }
     }
 }

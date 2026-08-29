@@ -97,6 +97,17 @@ impl KvsState {
         id
     }
 
+    /// Bumps the rowid generator for a table up to at least `min_next`, without ever
+    /// moving it backwards. Used when restoring a snapshot so new INSERTs can't collide
+    /// with rowids that were just loaded from disk.
+    pub fn set_min_next_rowid(&self, db_id: u32, table: &str, min_next: u64) {
+        let gens = self.rowid_generators.entry(db_id).or_insert_with(|| Arc::new(DashMap::new()));
+        let mut gen = gens.entry(table.to_string()).or_insert(1);
+        if *gen < min_next {
+            *gen = min_next;
+        }
+    }
+
     // ---- Raw key-value operations ----
     //
     // When `max_entries_per_table` is set, a table that grows past the limit
