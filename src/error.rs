@@ -43,4 +43,5 @@ impl From<serde_json::Error> for SkvsError {
 }
 
 // Alias kept for backwards compatibility with older code that referred to `KvsError`.
+#[allow(unused_imports)]
 pub use SkvsError as KvsError;

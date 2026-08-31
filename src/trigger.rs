@@ -14,7 +14,7 @@ pub fn fire_triggers(
     timing: TriggerTiming,
     old_row: Option<&Row>,
     new_row: Option<&Row>,
-    tx_id: Option<u64>,
+    tx_id: Option<u32>,
 ) -> Result<(), SkvsError> {
     // Get triggers for this table
     let triggers = state.get_triggers(db_id, table);

@@ -6,17 +6,20 @@ Think of it as **"SQLite, but multi-tenant, in-memory-first, with a write-ahead 
 
 * 🦀 Core storage + SQL engine written in Rust
 * 🧠 Multiple independent databases ("namespaces") per server instance
-* 📝 SQL support including `CREATE/DROP TABLE`, indexes, views, `INSERT`, `UPDATE`, `DELETE`, `SELECT`, `WHERE`, `JOIN`, `GROUP BY`, `ORDER BY`, `LIMIT`, `OFFSET`, `DISTINCT`, and aggregates
+* 📝 SQL support including `CREATE/DROP/ALTER TABLE`, indexes, views, `INSERT` (multi-row, `INSERT...SELECT`), `UPDATE`, `DELETE`, `SELECT`, `WHERE`, `JOIN` (`INNER`/`LEFT`/`RIGHT`/`FULL OUTER`/`CROSS`), `GROUP BY`, `ORDER BY`, `LIMIT`, `OFFSET`, `DISTINCT`, and aggregates
+* 🔒 Enforced `NOT NULL`, `UNIQUE`, `PRIMARY KEY` (including composite), `FOREIGN KEY`, and `CHECK` constraints
+* ↩️ Real `BEGIN`/`COMMIT`/`ROLLBACK` transactions (undo-journal based; every autocommit statement is also atomic on partial failure) — see [DOCUMENTATION.md §6a](./DOCUMENTATION.md#6a-transactions) for exactly what guarantees this does and doesn't give you
+* 💾 SQL tables, raw key/value data, views, and triggers all survive a process restart (periodic full-state snapshot, loaded back on startup)
 * 🔑 Raw key/value API alongside SQL
 * 🧾 Write-ahead log (WAL) with batched periodic `fsync`
 * 🔁 Peer-to-peer UDP replication between two servers
 * 🌐 HTTP API using Node.js + Express
 * 🔐 IP allow-list and shared API secret authentication
-* ⚙️ Triggers, constraints, JSON helpers, and a simple FTS (full-text search) virtual table
+* ⚙️ Triggers, constraints, JSON functions (`json_extract`/`json_array`/`json_object`/`json_set`), arithmetic/`CASE`/`LIKE`/`BETWEEN`/`IN` expressions, and a simple FTS5-style full-text search virtual table
 
-> ⚠️ **Status:** This is a hobby/learning project and is **not production-ready**.
+> ⚠️ **Status:** This started as a hobby/learning project and has had a thorough correctness pass: constraint enforcement, real transactions, full-restart persistence, OUTER JOINs, and a number of previously-silent bugs (see [DOCUMENTATION.md §8](./DOCUMENTATION.md#8-known-gaps--things-to-be-aware-of-read-before-extending)) are now fixed and covered by tests (`cargo test`: 19 passing; `test_skvs.py` end-to-end HTTP suite: 9 passing). It is **still not a hardened, horizontally-scalable production database** — see DOCUMENTATION.md §8 for the specific remaining gaps (transaction isolation, query-planner scope, replication guarantees, auth model) before relying on it for anything with real stakes.
 >
-> The project has been fixed to compile and pass basic smoke tests. See [DOCUMENTATION.md](./DOCUMENTATION.md) for the exact implementation status of individual features and known limitations.
+> See [DOCUMENTATION.md](./DOCUMENTATION.md) for the exact implementation status of individual features and known limitations.
 
 ---
 
@@ -185,6 +188,34 @@ curl -X POST http://127.0.0.1:3000/api/db/default/query \
   -H "x-api-key: change-me-to-something-long-and-random" \
   -d '{"sql":"SELECT * FROM users WHERE age > 18"}'
 ```
+
+### Transactions
+
+```bash
+# Start a transaction
+TX=$(curl -s -X POST http://127.0.0.1:3000/api/db/default/transaction/begin \
+  -H "x-api-key: change-me-to-something-long-and-random" | jq -r .txId)
+
+# Run statements as part of it by passing txId
+curl -X POST http://127.0.0.1:3000/api/db/default/query \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: change-me-to-something-long-and-random" \
+  -d "{\"sql\":\"UPDATE users SET age = age + 1 WHERE id = 1\",\"txId\":$TX}"
+
+# Then either:
+curl -X POST http://127.0.0.1:3000/api/db/default/transaction/$TX/commit \
+  -H "x-api-key: change-me-to-something-long-and-random"
+# ...or, to undo everything done under $TX:
+curl -X POST http://127.0.0.1:3000/api/db/default/transaction/$TX/rollback \
+  -H "x-api-key: change-me-to-something-long-and-random"
+```
+
+Every plain (no `txId`) INSERT/UPDATE/DELETE is also atomic on its own if it
+partially fails (e.g. a multi-row `INSERT` where a later row violates a
+constraint) — you don't need an explicit transaction just to avoid a
+half-applied statement. See [DOCUMENTATION.md §6a](./DOCUMENTATION.md#6a-transactions)
+for what these transactions do and don't guarantee (in short: atomicity and
+durability of the outcome, not isolation from concurrent transactions).
 
 ---
 

@@ -69,23 +69,73 @@ function getDbId(name) {
 
 app.post('/api/db/:dbName/query', async (req, res) => {
   const { dbName } = req.params;
-  const { sql, params } = req.body;
+  const { sql, params, txId } = req.body;
 
   const dbId = getDbId(dbName);
   if (dbId === null) {
     return res.status(404).json({ error: 'Database not found' });
   }
 
+  // A bare Buffer can't round-trip through JSON as a BLOB: the Rust side
+  // only ever sees a JSON string and has no way to tell "this string is
+  // base64 for binary data" apart from "this string is just text", so it
+  // used to land as a Value::Text (silently corrupting binary parameters
+  // for BLOB columns). Tagging it as {"__blob__": "<base64>"} lets
+  // Value::from_json on the Rust side recognize it and decode a real
+  // Value::Blob instead.
   const rustParams = (params || []).map(p => {
-    if (Buffer.isBuffer(p)) return p.toString('base64');
+    if (Buffer.isBuffer(p)) return { __blob__: p.toString('base64') };
     return p; // numbers, strings, null and booleans pass straight through
   });
 
   try {
-    const result = skvs.query(dbId, sql, rustParams);
+    const result = skvs.query(dbId, sql, rustParams, txId ?? null);
     res.json(result);
   } catch (err) {
     console.error('SQL error:', err);
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Transactions: begin one here, thread the returned txId through the `txId`
+// field of subsequent /query calls (including BEGIN/COMMIT/ROLLBACK issued
+// as literal SQL text, which also read/return txId the same way), then
+// commit or roll it back. Since HTTP requests are stateless, the
+// transaction's identity has to travel in the request/response bodies like
+// this rather than being tied to a persistent connection.
+app.post('/api/db/:dbName/transaction/begin', (req, res) => {
+  const { dbName } = req.params;
+  const dbId = getDbId(dbName);
+  if (dbId === null) {
+    return res.status(404).json({ error: 'Database not found' });
+  }
+  try {
+    const txId = skvs.beginTransaction(dbId);
+    res.json({ txId });
+  } catch (err) {
+    console.error('BEGIN error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/db/:dbName/transaction/:txId/commit', (req, res) => {
+  const txId = Number(req.params.txId);
+  try {
+    skvs.commitTransaction(txId);
+    res.status(204).send();
+  } catch (err) {
+    console.error('COMMIT error:', err);
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.post('/api/db/:dbName/transaction/:txId/rollback', (req, res) => {
+  const txId = Number(req.params.txId);
+  try {
+    skvs.rollbackTransaction(txId);
+    res.status(204).send();
+  } catch (err) {
+    console.error('ROLLBACK error:', err);
     res.status(400).json({ error: err.message });
   }
 });

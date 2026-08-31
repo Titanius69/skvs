@@ -1,6 +1,6 @@
 use sqlparser::ast::{
-    ColumnDef as SqlColDef, ColumnOption, ObjectType, ReferentialAction, Statement,
-    TableConstraint,
+    AlterTableOperation, ColumnDef as SqlColDef, ColumnOption, ObjectType, ReferentialAction,
+    Statement, TableConstraint,
 };
 use crate::state::KvsState;
 use crate::schema::*;
@@ -35,6 +35,8 @@ pub fn create_table(
     let mut columns = IndexMap::new();
     let mut primary_keys = Vec::new();
     let mut foreign_keys = Vec::new();
+    let mut unique_groups = Vec::new();
+    let mut table_checks = Vec::new();
 
     for col in sql_columns {
         let col_def = parse_column_def(col);
@@ -46,7 +48,32 @@ pub fn create_table(
 
     for constraint in constraints {
         match constraint {
-            TableConstraint::Unique { .. } => {}
+            // Table-level `[CONSTRAINT name] { PRIMARY KEY | UNIQUE } (col, ...)`.
+            // Previously silently ignored - the very common
+            // `CREATE TABLE t (id INTEGER, ..., PRIMARY KEY(id))` form (as
+            // opposed to `id INTEGER PRIMARY KEY`) left the table with no
+            // rowid_column and no uniqueness enforcement at all.
+            TableConstraint::Unique { columns: cols, is_primary, .. } => {
+                let col_names: Vec<String> = cols.iter().map(|c| c.value.clone()).collect();
+                if *is_primary {
+                    for c in &col_names {
+                        if let Some(cd) = columns.get_mut(c) {
+                            cd.primary_key = true;
+                            cd.not_null = true;
+                        }
+                    }
+                    if let Some(first) = col_names.first() {
+                        primary_keys.push(first.clone());
+                    }
+                } else {
+                    for c in &col_names {
+                        if let Some(cd) = columns.get_mut(c) {
+                            cd.unique = true;
+                        }
+                    }
+                }
+                unique_groups.push(UniqueGroup { columns: col_names, is_primary: *is_primary });
+            }
             TableConstraint::ForeignKey {
                 columns: fk_columns, foreign_table, referred_columns, on_delete, on_update, ..
             } => {
@@ -62,6 +89,9 @@ pub fn create_table(
                 };
                 foreign_keys.push(fk);
             }
+            TableConstraint::Check { expr, .. } => {
+                table_checks.push(expr.to_string());
+            }
             _ => {}
         }
     }
@@ -73,6 +103,9 @@ pub fn create_table(
         foreign_keys,
         indices: vec![],
         triggers: vec![],
+        unique_groups,
+        table_checks,
+        fts5_content_column: None,
     };
 
     schemas.insert(table_name.clone(), Arc::new(schema));
@@ -103,7 +136,7 @@ fn parse_column_def(col: &SqlColDef) -> ColumnDef {
     let mut not_null = false;
     let mut unique = false;
     let mut default = None;
-    let auto_increment = false;
+    let mut auto_increment = false;
     let mut check_expr = None;
 
     for opt in &col.options {
@@ -116,8 +149,27 @@ fn parse_column_def(col: &SqlColDef) -> ColumnDef {
                     not_null = true;
                 }
             }
-            ColumnOption::Default(_) => default = Some(Value::Null),
+            // `DEFAULT <expr>` previously always stored Value::Null instead
+            // of the literal that was actually written, silently discarding
+            // every `DEFAULT 0` / `DEFAULT 'x'` / `DEFAULT CURRENT_TIMESTAMP`
+            // in the schema. Evaluate it as a constant expression (no row/
+            // params available at DDL time, so only literal defaults
+            // resolve to something other than NULL - that matches what a
+            // real default actually is: a constant).
+            ColumnOption::Default(expr) => {
+                let mut idx = 0usize;
+                let ctx = crate::expr::EvalCtx::no_row();
+                default = Some(crate::expr::eval(expr, &ctx, &[], &mut idx));
+            }
             ColumnOption::Check(expr) => check_expr = Some(expr.to_string()),
+            // MySQL `AUTO_INCREMENT` / SQLite `AUTOINCREMENT` arrive as an
+            // opaque token list rather than a dedicated AST variant.
+            ColumnOption::DialectSpecific(tokens) => {
+                let joined = tokens.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(" ").to_uppercase();
+                if joined.contains("AUTOINCREMENT") || joined.contains("AUTO_INCREMENT") {
+                    auto_increment = true;
+                }
+            }
             _ => {}
         }
     }
@@ -177,8 +229,106 @@ pub fn drop_table(state: &KvsState, db_id: u32, stmt: &Statement) -> Result<Quer
     Ok(QueryResult::empty())
 }
 
-pub fn alter_table(_state: &KvsState, _db_id: u32, _stmt: &Statement) -> Result<QueryResult, SkvsError> {
-    // Full ALTER TABLE support (add/drop/rename columns) is not implemented yet.
+/// `ALTER TABLE`: supports `ADD COLUMN`, `DROP COLUMN`, `RENAME COLUMN ... TO ...`,
+/// and `RENAME TO <new_name>`. Multiple operations in one statement (as
+/// sqlparser allows) are applied in order.
+pub fn alter_table(state: &KvsState, db_id: u32, stmt: &Statement) -> Result<QueryResult, SkvsError> {
+    let (name, if_exists, operations) = match stmt {
+        Statement::AlterTable { name, if_exists, operations, .. } => (name, *if_exists, operations),
+        _ => return Err(SkvsError::Unsupported("Not an ALTER TABLE statement".into())),
+    };
+    let mut table_name = name.to_string();
+
+    let schemas = state.schemas.get(&db_id)
+        .ok_or_else(|| SkvsError::Schema(format!("Database {} not found", db_id)))?;
+
+    if !schemas.contains_key(&table_name) {
+        if if_exists {
+            return Ok(QueryResult::empty());
+        }
+        return Err(SkvsError::Schema(format!("Table {} not found", table_name)));
+    }
+
+    for op in operations {
+        match op {
+            AlterTableOperation::AddColumn { column_def, .. } => {
+                let col_def = parse_column_def(column_def);
+                let mut schema = (**schemas.get(&table_name).unwrap()).clone();
+                if schema.columns.contains_key(&col_def.name) {
+                    return Err(SkvsError::Schema(format!("Column {} already exists", col_def.name)));
+                }
+                // Backfill the new column onto every existing row so
+                // `SELECT *` and constraint checks see a consistent shape
+                // immediately, matching what SQLite does for ADD COLUMN.
+                if let Some(store) = state.get_table_store(db_id, &table_name) {
+                    let default = col_def.default.clone().unwrap_or(Value::Null);
+                    for mut entry in store.iter_mut() {
+                        entry.value_mut().insert(col_def.name.clone(), default.clone());
+                    }
+                }
+                schema.columns.insert(col_def.name.clone(), col_def);
+                schemas.insert(table_name.clone(), Arc::new(schema));
+            }
+            AlterTableOperation::DropColumn { column_name, if_exists: col_if_exists, .. } => {
+                let mut schema = (**schemas.get(&table_name).unwrap()).clone();
+                let col = column_name.value.clone();
+                if !schema.columns.shift_remove(&col).is_some() && !*col_if_exists {
+                    return Err(SkvsError::Schema(format!("Column {} not found", col)));
+                }
+                if schema.rowid_column.as_deref() == Some(col.as_str()) {
+                    schema.rowid_column = None;
+                }
+                if let Some(store) = state.get_table_store(db_id, &table_name) {
+                    for mut entry in store.iter_mut() {
+                        entry.value_mut().shift_remove(&col);
+                    }
+                }
+                schemas.insert(table_name.clone(), Arc::new(schema));
+            }
+            AlterTableOperation::RenameColumn { old_column_name, new_column_name } => {
+                let mut schema = (**schemas.get(&table_name).unwrap()).clone();
+                let old = old_column_name.value.clone();
+                let new = new_column_name.value.clone();
+                let (idx, _, mut col_def) = schema.columns.shift_remove_full(&old)
+                    .ok_or_else(|| SkvsError::Schema(format!("Column {} not found", old)))?
+                    .into();
+                col_def.name = new.clone();
+                schema.columns.shift_insert(idx.min(schema.columns.len()), new.clone(), col_def);
+                if schema.rowid_column.as_deref() == Some(old.as_str()) {
+                    schema.rowid_column = Some(new.clone());
+                }
+                if let Some(store) = state.get_table_store(db_id, &table_name) {
+                    for mut entry in store.iter_mut() {
+                        if let Some(v) = entry.value_mut().shift_remove(&old) {
+                            entry.value_mut().insert(new.clone(), v);
+                        }
+                    }
+                }
+                schemas.insert(table_name.clone(), Arc::new(schema));
+            }
+            AlterTableOperation::RenameTable { table_name: new_name } => {
+                let new_table = new_name.to_string();
+                if let Some((_, schema)) = schemas.remove(&table_name) {
+                    schemas.insert(new_table.clone(), schema);
+                }
+                if let Some(dbs) = state.dbs.get(&db_id) {
+                    if let Some((_, store)) = dbs.remove(&table_name) {
+                        dbs.insert(new_table.clone(), store);
+                    }
+                }
+                if let Some(gens) = state.rowid_generators.get(&db_id) {
+                    if let Some((_, g)) = gens.remove(&table_name) {
+                        gens.insert(new_table.clone(), g);
+                    }
+                }
+                table_name = new_table;
+            }
+            _ => {
+                return Err(SkvsError::Unsupported(format!("ALTER TABLE operation not supported: {}", op)));
+            }
+        }
+    }
+
     Ok(QueryResult::empty())
 }
 
@@ -310,6 +460,9 @@ pub fn create_virtual_table(state: &KvsState, db_id: u32, stmt: &Statement) -> R
         foreign_keys: vec![],
         indices: vec![],
         triggers: vec![],
+        unique_groups: vec![],
+        table_checks: vec![],
+        fts5_content_column: Some(content_column.clone()),
     };
     schemas.insert(name.clone(), Arc::new(schema));
 

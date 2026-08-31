@@ -7,6 +7,7 @@ use tokio::runtime::Runtime;
 mod config;
 mod constraint;
 mod error;
+mod expr;
 mod fts;
 mod index;
 mod json;
@@ -75,13 +76,13 @@ pub fn get_db_id_by_name(name: String) -> Option<u32> {
 }
 
 #[napi]
-pub fn query(db_id: u32, sql: String, params: Vec<serde_json::Value>) -> Result<serde_json::Value> {
+pub fn query(db_id: u32, sql: String, params: Vec<serde_json::Value>, tx_id: Option<u32>) -> Result<serde_json::Value> {
     let state = STATE.get().ok_or_else(|| Error::from_reason("Not initialized"))?;
     let params = params
         .into_iter()
         .map(|v| schema::Value::from_json(v).unwrap_or(schema::Value::Null))
         .collect::<Vec<_>>();
-    let result = sql::SqlEngine::execute(state, db_id, &sql, &params, None)
+    let result = sql::SqlEngine::execute(state, db_id, &sql, &params, tx_id)
         .map_err(to_js_err)?;
 
     // Build the JSON response by hand instead of relying on `Value`'s derived
@@ -100,7 +101,29 @@ pub fn query(db_id: u32, sql: String, params: Vec<serde_json::Value>) -> Result<
         "columns": result.columns,
         "rows": rows,
         "affected_rows": result.affected_rows,
+        "tx_id": result.tx_id,
     }))
+}
+
+/// Starts a new transaction and returns its id. Every subsequent `query()`
+/// call that should be part of it (including the final `commit_transaction`
+/// / `rollback_transaction`) must pass that id back in.
+#[napi]
+pub fn begin_transaction(db_id: u32) -> Result<u32> {
+    let state = STATE.get().ok_or_else(|| Error::from_reason("Not initialized"))?;
+    Ok(state.txns.begin(db_id))
+}
+
+#[napi]
+pub fn commit_transaction(tx_id: u32) -> Result<()> {
+    let state = STATE.get().ok_or_else(|| Error::from_reason("Not initialized"))?;
+    state.txns.commit(tx_id).map_err(to_js_err)
+}
+
+#[napi]
+pub fn rollback_transaction(tx_id: u32) -> Result<()> {
+    let state = STATE.get().ok_or_else(|| Error::from_reason("Not initialized"))?;
+    state.txns.rollback(state, tx_id).map_err(to_js_err)
 }
 
 #[napi]

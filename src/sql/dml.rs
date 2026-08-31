@@ -1,4 +1,4 @@
-use sqlparser::ast::{Assignment, Expr, SetExpr, Statement, Value as SqlValue};
+use sqlparser::ast::{Assignment, SetExpr, Statement};
 use crate::state::KvsState;
 use crate::schema::*;
 use crate::constraint::validate_constraints;
@@ -6,14 +6,22 @@ use crate::index::{update_indexes, IndexOp};
 use crate::trigger::fire_triggers;
 use crate::error::SkvsError;
 use crate::sql::QueryResult;
-use crate::sql::select::evaluate_where;
+use crate::sql::select::evaluate_where_ctx;
+use crate::expr::{count_placeholders, eval, EvalCtx};
+use crate::transaction::UndoOp;
+
+fn journal(state: &KvsState, tx_id: Option<u32>, op: UndoOp) {
+    if let Some(id) = tx_id {
+        state.txns.record(id, op);
+    }
+}
 
 pub fn execute_insert(
     state: &KvsState,
     db_id: u32,
     stmt: &Statement,
     params: &[Value],
-    tx_id: Option<u64>,
+    tx_id: Option<u32>,
 ) -> Result<QueryResult, SkvsError> {
     if let Statement::Insert { table_name, columns, source, .. } = stmt {
         let table = table_name.to_string();
@@ -21,65 +29,86 @@ pub fn execute_insert(
             .ok_or_else(|| SkvsError::Schema(format!("Table {} not found", table)))?;
         let store = state.get_table_store(db_id, &table)
             .ok_or_else(|| SkvsError::Schema(format!("Store for {} not found", table)))?;
-        let rowid = state.get_next_rowid(db_id, &table);
 
-        let mut row = Row::new();
         let col_names: Vec<String> = if columns.is_empty() {
             schema.columns.keys().cloned().collect::<Vec<_>>()
         } else {
             columns.iter().map(|c| c.value.clone()).collect()
         };
 
-        let mut param_idx = 0usize;
+        // Build the list of rows to insert, either from a `VALUES (...), (...), ...`
+        // list (every tuple, not just the first - a single-row-only INSERT here used
+        // to silently drop every row after the first) or from `INSERT INTO t SELECT ...`.
+        let mut candidate_rows: Vec<Row> = Vec::new();
         if let Some(source) = source {
-            if let SetExpr::Values(values) = source.body.as_ref() {
-                if let Some(value_row) = values.rows.first() {
-                    for (i, col_name) in col_names.iter().enumerate() {
-                        if i < value_row.len() {
-                            let expr = &value_row[i];
-                            let val = evaluate_expr(expr, params, &mut param_idx)?;
-                            row.insert(col_name.clone(), val);
+            match source.body.as_ref() {
+                SetExpr::Values(values) => {
+                    let ctx = EvalCtx::no_row();
+                    for value_row in &values.rows {
+                        let mut param_idx = 0usize;
+                        let mut row = Row::new();
+                        for (i, col_name) in col_names.iter().enumerate() {
+                            if i < value_row.len() {
+                                let val = eval(&value_row[i], &ctx, params, &mut param_idx);
+                                row.insert(col_name.clone(), val);
+                            }
                         }
+                        candidate_rows.push(row);
+                    }
+                }
+                SetExpr::Select(_) => {
+                    let inner = crate::sql::select::execute_select(state, db_id, source, params, tx_id)?;
+                    for src_row in inner.rows {
+                        let mut row = Row::new();
+                        for (col_name, val) in col_names.iter().zip(src_row.values()) {
+                            row.insert(col_name.clone(), val.clone());
+                        }
+                        candidate_rows.push(row);
+                    }
+                }
+                _ => return Err(SkvsError::Unsupported("Unsupported INSERT source".into())),
+            }
+        }
+        if candidate_rows.is_empty() {
+            candidate_rows.push(Row::new());
+        }
+
+        let mut affected = 0u64;
+        for mut row in candidate_rows {
+            let rowid = state.get_next_rowid(db_id, &table);
+
+            // Apply column defaults for anything not supplied. An omitted
+            // INTEGER PRIMARY KEY auto-generates from the row counter (SQLite's
+            // "rowid alias" behavior), matching the assumption trigger bodies and
+            // callers make when they don't specify it explicitly.
+            for (col_name, col_def) in &schema.columns {
+                if !row.contains_key(col_name) {
+                    if col_def.primary_key && col_def.data_type == DataType::Integer {
+                        row.insert(col_name.clone(), Value::Integer(rowid as i64));
+                    } else if let Some(default) = &col_def.default {
+                        row.insert(col_name.clone(), default.clone());
+                    } else {
+                        row.insert(col_name.clone(), Value::Null);
                     }
                 }
             }
+
+            validate_constraints(state, db_id, &schema, &row, rowid, None)?;
+
+            fire_triggers(state, db_id, &table, TriggerEvent::Insert, TriggerTiming::Before, None, Some(&row), tx_id)?;
+
+            store.insert(rowid, row.clone());
+            journal(state, tx_id, UndoOp::Insert { table: table.clone(), rowid });
+
+            update_indexes(state, db_id, &table, &row, rowid, IndexOp::Insert)?;
+            sync_fts_index(state, db_id, &table, rowid, Some(&row), false);
+
+            fire_triggers(state, db_id, &table, TriggerEvent::Insert, TriggerTiming::After, None, Some(&row), tx_id)?;
+
+            affected += 1;
         }
 
-        // Apply column defaults for anything not supplied. An omitted
-        // INTEGER PRIMARY KEY auto-generates from the row counter (SQLite's
-        // "rowid alias" behavior), matching the assumption trigger bodies and
-        // callers make when they don't specify it explicitly.
-        for (col_name, col_def) in &schema.columns {
-            if !row.contains_key(col_name) {
-                if col_def.primary_key && col_def.data_type == DataType::Integer {
-                    row.insert(col_name.clone(), Value::Integer(rowid as i64));
-                } else if let Some(default) = &col_def.default {
-                    row.insert(col_name.clone(), default.clone());
-                } else {
-                    row.insert(col_name.clone(), Value::Null);
-                }
-            }
-        }
-
-        // Validate constraints
-        validate_constraints(state, db_id, &schema, &row, None)?;
-
-        // BEFORE INSERT triggers
-        fire_triggers(state, db_id, &table, TriggerEvent::Insert, TriggerTiming::Before, None, Some(&row), tx_id)?;
-
-        // Insert into store
-        store.insert(rowid, row.clone());
-
-        // Update indexes
-        update_indexes(state, db_id, &table, &row, rowid, IndexOp::Insert)?;
-
-        // Keep any fts5 virtual table's full-text index in sync
-        sync_fts_index(state, db_id, &table, rowid, Some(&row), false);
-
-        // AFTER INSERT triggers
-        fire_triggers(state, db_id, &table, TriggerEvent::Insert, TriggerTiming::After, None, Some(&row), tx_id)?;
-
-        Ok(QueryResult::affected(1))
+        Ok(QueryResult::affected(affected))
     } else {
         Err(SkvsError::Unsupported("Not an INSERT statement".into()))
     }
@@ -90,7 +119,7 @@ pub fn execute_update(
     db_id: u32,
     stmt: &Statement,
     params: &[Value],
-    tx_id: Option<u64>,
+    tx_id: Option<u32>,
 ) -> Result<QueryResult, SkvsError> {
     if let Statement::Update { table, assignments, selection, .. } = stmt {
         let table_name = match &table.relation {
@@ -119,13 +148,12 @@ pub fn execute_update(
             .map(|assignment| count_placeholders(&assignment.value))
             .sum();
 
-        // Collect rows
         for entry in store.iter() {
             let rowid = *entry.key();
             let row = entry.value();
             let mut where_param_idx = set_param_count;
             let matches = match selection {
-                Some(where_expr) => evaluate_where(row, where_expr, params, &mut where_param_idx),
+                Some(where_expr) => evaluate_where_ctx(state, db_id, row, where_expr, params, &mut where_param_idx),
                 None => true,
             };
             if matches {
@@ -133,37 +161,36 @@ pub fn execute_update(
             }
         }
 
-        // Apply updates
         for (rowid, old_row) in rows_to_update {
             let mut new_row = old_row.clone();
             let mut param_idx = 0usize;
+            // SET expressions see the row as it was *before* this statement's
+            // changes (standard SQL semantics), so `SET a = a + 1, b = a` uses
+            // the original `a`, not one another's freshly-written values -
+            // hence evaluating every assignment against `old_row`, not the
+            // in-progress `new_row`.
+            let ctx = EvalCtx::with_row(&old_row);
             for assignment in assignments {
                 let Assignment { id, value } = assignment;
                 let col_name = id
                     .last()
                     .map(|ident| ident.value.clone())
                     .unwrap_or_default();
-                let new_val = evaluate_expr(value, params, &mut param_idx)?;
+                let new_val = eval(value, &ctx, params, &mut param_idx);
                 new_row.insert(col_name, new_val);
             }
 
-            // Validate constraints
-            validate_constraints(state, db_id, &schema, &new_row, Some(&old_row))?;
+            validate_constraints(state, db_id, &schema, &new_row, rowid, Some(&old_row))?;
 
-            // BEFORE UPDATE triggers
             fire_triggers(state, db_id, &table_name, TriggerEvent::Update, TriggerTiming::Before, Some(&old_row), Some(&new_row), tx_id)?;
 
-            // Update store
             store.insert(rowid, new_row.clone());
+            journal(state, tx_id, UndoOp::Update { table: table_name.clone(), rowid, old_row: old_row.clone() });
             affected += 1;
 
-            // Update indexes
             update_indexes(state, db_id, &table_name, &new_row, rowid, IndexOp::Update { old_row: old_row.clone() })?;
+            sync_fts_index_change(state, db_id, &table_name, rowid, Some(&old_row), Some(&new_row));
 
-            // Keep any fts5 virtual table's full-text index in sync
-            sync_fts_index(state, db_id, &table_name, rowid, Some(&new_row), false);
-
-            // AFTER UPDATE triggers
             fire_triggers(state, db_id, &table_name, TriggerEvent::Update, TriggerTiming::After, Some(&old_row), Some(&new_row), tx_id)?;
         }
 
@@ -178,7 +205,7 @@ pub fn execute_delete(
     db_id: u32,
     stmt: &Statement,
     params: &[Value],
-    tx_id: Option<u64>,
+    tx_id: Option<u32>,
 ) -> Result<QueryResult, SkvsError> {
     if let Statement::Delete { tables, from, selection, .. } = stmt {
         let table_name = if let Some(t) = tables.first() {
@@ -203,7 +230,7 @@ pub fn execute_delete(
             let row = entry.value();
             let mut where_param_idx = 0usize;
             let matches = match selection {
-                Some(where_expr) => evaluate_where(row, where_expr, params, &mut where_param_idx),
+                Some(where_expr) => evaluate_where_ctx(state, db_id, row, where_expr, params, &mut where_param_idx),
                 None => true,
             };
             if matches {
@@ -212,17 +239,14 @@ pub fn execute_delete(
         }
 
         for (rowid, row) in rows_to_delete {
-            // BEFORE DELETE triggers
             fire_triggers(state, db_id, &table_name, TriggerEvent::Delete, TriggerTiming::Before, Some(&row), None, tx_id)?;
 
             store.remove(&rowid);
+            journal(state, tx_id, UndoOp::Delete { table: table_name.clone(), rowid, row: row.clone() });
             affected += 1;
             update_indexes(state, db_id, &table_name, &row, rowid, IndexOp::Delete)?;
-
-            // Keep any fts5 virtual table's full-text index in sync
             sync_fts_index(state, db_id, &table_name, rowid, Some(&row), true);
 
-            // AFTER DELETE triggers
             fire_triggers(state, db_id, &table_name, TriggerEvent::Delete, TriggerTiming::After, Some(&row), None, tx_id)?;
         }
 
@@ -232,60 +256,10 @@ pub fn execute_delete(
     }
 }
 
-/// Counts how many `?` placeholders an expression consumes, without needing
-/// any actual param values. Used to figure out where in the flat `params`
-/// list a later, independent expression (e.g. a WHERE clause following a
-/// SET list) should start reading from. Must walk exactly the same node
-/// types `evaluate_expr` recurses into, or the two will disagree about how
-/// many placeholders were consumed.
-fn count_placeholders(expr: &Expr) -> usize {
-    match expr {
-        Expr::Value(SqlValue::Placeholder(_)) => 1,
-        Expr::Value(_) => 0,
-        Expr::UnaryOp { expr, .. } => count_placeholders(expr),
-        Expr::Nested(inner) => count_placeholders(inner),
-        Expr::BinaryOp { left, right, .. } => count_placeholders(left) + count_placeholders(right),
-        _ => 0,
-    }
-}
-
-/// Evaluate a scalar expression down to a stored `Value`, substituting `?`
-/// placeholders from `params` in left-to-right order.
-pub fn evaluate_expr(expr: &Expr, params: &[Value], param_idx: &mut usize) -> Result<Value, SkvsError> {
-    match expr {
-        Expr::Value(value) => match value {
-            SqlValue::Number(n, _) => {
-                if let Ok(i) = n.parse::<i64>() { Ok(Value::Integer(i)) }
-                else if let Ok(f) = n.parse::<f64>() { Ok(Value::Real(f)) }
-                else { Ok(Value::Null) }
-            }
-            SqlValue::SingleQuotedString(s) => Ok(Value::Text(s.clone())),
-            SqlValue::Null => Ok(Value::Null),
-            SqlValue::Boolean(b) => Ok(Value::Integer(if *b { 1 } else { 0 })),
-            SqlValue::Placeholder(_) => {
-                let val = params.get(*param_idx).cloned().unwrap_or(Value::Null);
-                *param_idx += 1;
-                Ok(val)
-            }
-            _ => Ok(Value::Null),
-        },
-        Expr::Identifier(_) => Ok(Value::Null),
-        Expr::UnaryOp { op, expr } => {
-            let inner = evaluate_expr(expr, params, param_idx)?;
-            match (op, inner) {
-                (sqlparser::ast::UnaryOperator::Minus, Value::Integer(i)) => Ok(Value::Integer(-i)),
-                (sqlparser::ast::UnaryOperator::Minus, Value::Real(f)) => Ok(Value::Real(-f)),
-                (_, other) => Ok(other),
-            }
-        }
-        _ => Ok(Value::Null),
-    }
-}
-
 /// If `table` has a registered fts5 virtual table, keep its inverted index in
 /// sync. `row` holds the row's contents (new contents for insert/update, the
 /// just-deleted contents for a delete); `is_delete` selects which.
-fn sync_fts_index(state: &KvsState, db_id: u32, table: &str, rowid: RowId, row: Option<&Row>, is_delete: bool) {
+pub fn sync_fts_index(state: &KvsState, db_id: u32, table: &str, rowid: RowId, row: Option<&Row>, is_delete: bool) {
     let fts = match state.get_fts_table(db_id, table) {
         Some(fts) => fts,
         None => return,
@@ -307,6 +281,26 @@ fn sync_fts_index(state: &KvsState, db_id: u32, table: &str, rowid: RowId, row: 
             let rt = tokio::runtime::Runtime::new().expect("failed to create runtime");
             rt.block_on(fut);
         }
+    }
+}
+
+/// Moves a row's fts5 index entry from `old_row`'s content to `new_row`'s.
+/// Used by UPDATE, and by rolling back an UPDATE (with the arguments
+/// swapped).
+///
+/// Previously UPDATE only ever called the insert half of this (re-indexing
+/// the new content) and never removed the old content's tokens first. That
+/// left every earlier version of an updated row's text permanently
+/// searchable - a query would keep matching content that had since been
+/// edited away - and inflated the FTS table's internal document counter by
+/// one on every single update to the same row, corrupting its (unused so
+/// far, but present) ranking statistics.
+pub fn sync_fts_index_change(state: &KvsState, db_id: u32, table: &str, rowid: RowId, old_row: Option<&Row>, new_row: Option<&Row>) {
+    if old_row.is_some() {
+        sync_fts_index(state, db_id, table, rowid, old_row, true);
+    }
+    if new_row.is_some() {
+        sync_fts_index(state, db_id, table, rowid, new_row, false);
     }
 }
 
@@ -344,15 +338,14 @@ mod tests {
             None,
         ).unwrap();
 
-        // SET updated_at=?, inventory=?  WHERE uuid=? AND updated_at<=?
         let result = SqlEngine::execute(
             &state, 0,
             "UPDATE t SET updated_at = ?, inventory = ? WHERE uuid = ? AND updated_at <= ?",
             &[
-                Value::Integer(200),                 // SET updated_at
-                Value::Text("new".into()),            // SET inventory
-                Value::Text("abc-123".into()),        // WHERE uuid
-                Value::Integer(100),                  // WHERE updated_at <=
+                Value::Integer(200),
+                Value::Text("new".into()),
+                Value::Text("abc-123".into()),
+                Value::Integer(100),
             ],
             None,
         ).unwrap();
@@ -370,17 +363,71 @@ mod tests {
     }
 
     #[test]
-    fn count_placeholders_matches_evaluate_expr_consumption() {
-        use sqlparser::dialect::GenericDialect;
-        use sqlparser::parser::Parser;
+    fn multi_row_insert_inserts_every_row() {
+        let state = new_state();
+        SqlEngine::execute(&state, 0, "CREATE TABLE t (a INTEGER, b INTEGER)", &[], None).unwrap();
+        let result = SqlEngine::execute(
+            &state, 0,
+            "INSERT INTO t (a, b) VALUES (1, 2), (3, 4), (5, 6)",
+            &[], None,
+        ).unwrap();
+        assert_eq!(result.affected_rows, Some(3));
+        let rows = SqlEngine::execute(&state, 0, "SELECT a, b FROM t ORDER BY a", &[], None).unwrap();
+        assert_eq!(rows.rows.len(), 3);
+        assert_eq!(rows.rows[2].get("a"), Some(&Value::Integer(5)));
+    }
 
-        let dialect = GenericDialect {};
-        let stmts = Parser::parse_sql(&dialect, "UPDATE t SET a = ?, b = ? WHERE id = ?").unwrap();
-        if let Statement::Update { assignments, .. } = &stmts[0] {
-            let total: usize = assignments.iter().map(|a| count_placeholders(&a.value)).sum();
-            assert_eq!(total, 2);
-        } else {
-            panic!("expected UPDATE statement");
-        }
+    #[test]
+    fn update_set_can_reference_other_columns() {
+        let state = new_state();
+        SqlEngine::execute(&state, 0, "CREATE TABLE t (a INTEGER, b INTEGER)", &[], None).unwrap();
+        SqlEngine::execute(&state, 0, "INSERT INTO t (a, b) VALUES (10, 0)", &[], None).unwrap();
+        SqlEngine::execute(&state, 0, "UPDATE t SET b = a + 1", &[], None).unwrap();
+        let rows = SqlEngine::execute(&state, 0, "SELECT b FROM t", &[], None).unwrap();
+        assert_eq!(rows.rows[0].get("b"), Some(&Value::Integer(11)));
+    }
+
+    #[test]
+    fn transaction_rollback_undoes_insert_and_update() {
+        let state = new_state();
+        SqlEngine::execute(&state, 0, "CREATE TABLE t (a INTEGER)", &[], None).unwrap();
+        SqlEngine::execute(&state, 0, "INSERT INTO t (a) VALUES (1)", &[], None).unwrap();
+
+        let tx = state.txns.begin(0);
+        SqlEngine::execute_single_statement(
+            &state, 0,
+            sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::GenericDialect {}, "INSERT INTO t (a) VALUES (2)").unwrap().remove(0),
+            &[], Some(tx),
+        ).unwrap();
+        SqlEngine::execute_single_statement(
+            &state, 0,
+            sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::GenericDialect {}, "UPDATE t SET a = 99 WHERE a = 1").unwrap().remove(0),
+            &[], Some(tx),
+        ).unwrap();
+
+        let mid = SqlEngine::execute(&state, 0, "SELECT a FROM t ORDER BY a", &[], None).unwrap();
+        assert_eq!(mid.rows.len(), 2);
+
+        state.txns.rollback(&state, tx).unwrap();
+
+        let after = SqlEngine::execute(&state, 0, "SELECT a FROM t ORDER BY a", &[], None).unwrap();
+        assert_eq!(after.rows.len(), 1);
+        assert_eq!(after.rows[0].get("a"), Some(&Value::Integer(1)));
+    }
+
+    #[test]
+    fn autocommit_insert_is_atomic_on_constraint_failure() {
+        let state = new_state();
+        SqlEngine::execute(&state, 0, "CREATE TABLE t (a INTEGER UNIQUE)", &[], None).unwrap();
+        SqlEngine::execute(&state, 0, "INSERT INTO t (a) VALUES (1)", &[], None).unwrap();
+
+        // Second value (1) collides with the row already there - the whole
+        // statement (including the first, otherwise-valid, value 2) should
+        // be rolled back rather than partially applied.
+        let err = SqlEngine::execute(&state, 0, "INSERT INTO t (a) VALUES (2), (1)", &[], None);
+        assert!(err.is_err());
+
+        let rows = SqlEngine::execute(&state, 0, "SELECT a FROM t", &[], None).unwrap();
+        assert_eq!(rows.rows.len(), 1, "partial insert must have been rolled back");
     }
 }

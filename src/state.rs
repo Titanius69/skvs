@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use crate::schema::*;
 use crate::fts::FtsVirtualTable;
 use crate::virtual_table::VirtualTableRegistry;
+use crate::transaction::TxnManager;
 use crate::error::SkvsError;
 
 pub struct KvsState {
@@ -23,6 +24,8 @@ pub struct KvsState {
     pub fts_tables: DashMap<u32, Arc<DashMap<String, Arc<FtsVirtualTable>>>>,
     // Virtual table registry
     pub virtual_tables: DashMap<u32, Arc<VirtualTableRegistry>>,
+    // BEGIN/COMMIT/ROLLBACK undo journals, keyed by transaction id.
+    pub txns: TxnManager,
 
     // If > 0, raw_stores tables that grow past this many in-memory entries
     // spill their oldest-seen entries out to disk (see `overflow_dir`) to
@@ -70,6 +73,7 @@ impl KvsState {
             views,
             fts_tables,
             virtual_tables,
+            txns: TxnManager::new(),
             max_entries_per_table,
             overflow_dir: PathBuf::from(overflow_dir),
         }

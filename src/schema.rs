@@ -33,6 +33,19 @@ impl Value {
                 else { None }
             }
             serde_json::Value::String(s) => Some(Value::Text(s)),
+            // Tagged-blob convention: `{"__blob__": "<base64>"}`. This is how
+            // a caller (server.js) sends a real BLOB parameter over JSON/HTTP
+            // - a bare JSON string always becomes Value::Text, since JSON has
+            // no separate binary type and we can't otherwise tell "this
+            // string is base64 for a blob" from "this string is just text".
+            serde_json::Value::Object(ref obj) if obj.len() == 1 && obj.contains_key("__blob__") => {
+                match obj.get("__blob__") {
+                    Some(serde_json::Value::String(b64)) => {
+                        base64::decode(b64).ok().map(Value::Blob)
+                    }
+                    _ => None,
+                }
+            }
             serde_json::Value::Array(arr) => {
                 let json_str = serde_json::to_string(&arr).ok()?;
                 Some(Value::Blob(json_str.into_bytes()))
@@ -60,13 +73,43 @@ impl Value {
         }
     }
 
+    /// Ordering used by `WHERE`/`ORDER BY`/`BETWEEN`/index range logic.
+    ///
+    /// Values of the same "numeric family" (Integer/Real) compare
+    /// numerically even when their variants differ - this matters a lot in
+    /// practice, since a column stored as REAL (e.g. `price REAL`) is very
+    /// commonly compared against an integer literal (`WHERE price > 100`).
+    /// Comparing across genuinely different types (e.g. text vs. integer)
+    /// falls back to a fixed type-rank ordering (SQLite's NULL < INTEGER/REAL
+    /// < TEXT < BLOB) so results are at least stable/total instead of the
+    /// previous behavior of silently reporting every cross-type comparison
+    /// as `Equal` (which made e.g. `WHERE real_column > 100` always false).
     pub fn compare(&self, other: &Value) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
         match (self, other) {
+            (Value::Null, Value::Null) => Ordering::Equal,
+            (Value::Null, _) => Ordering::Less,
+            (_, Value::Null) => Ordering::Greater,
             (Value::Integer(i1), Value::Integer(i2)) => i1.cmp(i2),
-            (Value::Real(f1), Value::Real(f2)) => f1.partial_cmp(f2).unwrap_or(std::cmp::Ordering::Equal),
+            (Value::Real(f1), Value::Real(f2)) => f1.partial_cmp(f2).unwrap_or(Ordering::Equal),
+            (Value::Integer(i1), Value::Real(f2)) => {
+                (*i1 as f64).partial_cmp(f2).unwrap_or(Ordering::Equal)
+            }
+            (Value::Real(f1), Value::Integer(i2)) => {
+                f1.partial_cmp(&(*i2 as f64)).unwrap_or(Ordering::Equal)
+            }
             (Value::Text(s1), Value::Text(s2)) => s1.cmp(s2),
             (Value::Blob(b1), Value::Blob(b2)) => b1.cmp(b2),
-            _ => std::cmp::Ordering::Equal,
+            _ => self.type_rank().cmp(&other.type_rank()),
+        }
+    }
+
+    fn type_rank(&self) -> u8 {
+        match self {
+            Value::Null => 0,
+            Value::Integer(_) | Value::Real(_) => 1,
+            Value::Text(_) => 2,
+            Value::Blob(_) => 3,
         }
     }
 }
@@ -92,6 +135,29 @@ pub struct TableSchema {
     pub foreign_keys: Vec<ForeignKeyDef>,
     pub indices: Vec<IndexDef>,
     pub triggers: Vec<TriggerDef>,
+    /// Table-level `UNIQUE(col, ...)` / `PRIMARY KEY(col, ...)` constraints
+    /// (as opposed to a `col TYPE PRIMARY KEY` column option, which sets
+    /// `ColumnDef.primary_key`/`unique` directly). Each entry is a group of
+    /// column names that together must be unique; `is_primary` groups are
+    /// additionally NOT NULL.
+    #[serde(default)]
+    pub unique_groups: Vec<UniqueGroup>,
+    /// Table-level `CHECK (...)` constraints (as opposed to a per-column
+    /// `CHECK` option, stored in `ColumnDef.check_expr`).
+    #[serde(default)]
+    pub table_checks: Vec<String>,
+    /// Set for a `CREATE VIRTUAL TABLE ... USING fts5(...)` table: the name
+    /// of the column whose text content is indexed for full-text search.
+    /// Used to rebuild the in-memory FTS inverted index after a restart,
+    /// since only the raw rows (not the index) are persisted.
+    #[serde(default)]
+    pub fts5_content_column: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UniqueGroup {
+    pub columns: Vec<String>,
+    pub is_primary: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
