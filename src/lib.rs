@@ -77,31 +77,61 @@ pub fn get_db_id_by_name(name: String) -> Option<u32> {
 
 #[napi]
 pub fn query(db_id: u32, sql: String, params: Vec<serde_json::Value>, tx_id: Option<u32>) -> Result<serde_json::Value> {
+    let total_start = std::time::Instant::now();
+
     let state = STATE.get().ok_or_else(|| Error::from_reason("Not initialized"))?;
+
+    let parse_start = std::time::Instant::now();
     let params = params
         .into_iter()
         .map(|v| schema::Value::from_json(v).unwrap_or(schema::Value::Null))
         .collect::<Vec<_>>();
+    let params_us = parse_start.elapsed().as_micros() as u64;
+
+    // This is the number that actually matters for "how fast is the
+    // database": pure Rust-side parse + plan + execute, with no JSON
+    // marshaling on either side of it. Everything else measured below is
+    // the FFI/serialization tax on top of it.
+    let engine_start = std::time::Instant::now();
     let result = sql::SqlEngine::execute(state, db_id, &sql, &params, tx_id)
         .map_err(to_js_err)?;
+    let engine_us = engine_start.elapsed().as_micros() as u64;
 
     // Build the JSON response by hand instead of relying on `Value`'s derived
     // `Serialize` impl. That derive produces externally-tagged JSON such as
     // {"Text": "Alice"} / {"Integer": 41}, which is correct for internal
     // (bincode) persistence but is not what HTTP clients expect. `to_json()`
     // turns each cell into a plain JSON scalar instead.
+    let encode_start = std::time::Instant::now();
     let rows: Vec<serde_json::Value> = result.rows.iter().map(|row| {
         let map: serde_json::Map<String, serde_json::Value> = row.iter()
             .map(|(k, v)| (k.clone(), v.to_json()))
             .collect();
         serde_json::Value::Object(map)
     }).collect();
+    let encode_us = encode_start.elapsed().as_micros() as u64;
+
+    let total_us = total_start.elapsed().as_micros() as u64;
 
     Ok(serde_json::json!({
         "columns": result.columns,
         "rows": rows,
         "affected_rows": result.affected_rows,
         "tx_id": result.tx_id,
+        // Timing breakdown handed to the Node side purely so server.js can
+        // log it - this never affects the query result itself.
+        // - params_us:  JS params -> Rust Value conversion
+        // - engine_us:  parse + plan + execute in the Rust engine (the number
+        //               that matters for "is the database itself fast")
+        // - encode_us:  Rust Value -> JSON conversion for the trip back to JS
+        // - total_us:   the whole query() call, i.e. params_us + engine_us +
+        //               encode_us + a little overhead
+        "timing": {
+            "params_us": params_us,
+            "engine_us": engine_us,
+            "encode_us": encode_us,
+            "total_us": total_us,
+        },
     }))
 }
 

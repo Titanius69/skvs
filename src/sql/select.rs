@@ -10,6 +10,7 @@ use crate::error::SkvsError;
 use crate::sql::QueryResult;
 use crate::expr::{self, truthy, EvalCtx};
 use std::collections::HashMap;
+use std::ops::Bound;
 
 pub fn execute_select(
     state: &KvsState,
@@ -152,15 +153,15 @@ fn rows_for_simple_where(
             if let Some(schema) = state.get_schema(db_id, table) {
                 if let Some(idx) = schema.indices.iter().find(|i| i.columns.len() == 1 && i.columns[0] == col) {
                     let ids = crate::index::lookup_index(state, db_id, table, &idx.name, &val);
-                    let store = state.get_table_store(db_id, table)
-                        .ok_or_else(|| SkvsError::Schema(format!("Table {} not found", table)))?;
-                    return Ok(ids.into_iter().filter_map(|rowid| {
-                        store.get(&rowid).map(|r| {
-                            let mut row = r.clone();
-                            row.insert("_rowid_".to_string(), Value::Integer(rowid as i64));
-                            row
-                        })
-                    }).collect());
+                    return rows_from_ids(state, db_id, table, ids);
+                }
+            }
+        }
+        if let Some((col, lower, upper)) = simple_range(where_expr, params) {
+            if let Some(schema) = state.get_schema(db_id, table) {
+                if let Some(idx) = schema.indices.iter().find(|i| i.columns.len() == 1 && i.columns[0] == col) {
+                    let ids = crate::index::range_lookup(state, db_id, table, &idx.name, lower, upper);
+                    return rows_from_ids(state, db_id, table, ids);
                 }
             }
         }
@@ -176,6 +177,79 @@ fn rows_for_simple_where(
         row.insert("_rowid_".to_string(), Value::Integer(*entry.key() as i64));
         row
     }).collect())
+}
+
+/// Turns a list of rowids straight into their rows (tagging each with the
+/// internal `_rowid_` field), used by both the equality and range index
+/// fast paths in `rows_for_simple_where` so an indexed WHERE never has to
+/// touch rows it can already rule out.
+fn rows_from_ids(state: &KvsState, db_id: u32, table: &str, ids: Vec<RowId>) -> Result<Vec<Row>, SkvsError> {
+    let store = state.get_table_store(db_id, table)
+        .ok_or_else(|| SkvsError::Schema(format!("Table {} not found", table)))?;
+    Ok(ids.into_iter().filter_map(|rowid| {
+        store.get(&rowid).map(|r| {
+            let mut row = r.clone();
+            row.insert("_rowid_".to_string(), Value::Integer(rowid as i64));
+            row
+        })
+    }).collect())
+}
+
+/// Recognizes a WHERE clause that is *exactly* one range comparison on a
+/// single column against a literal/param (`col > x`, `x <= col`, or
+/// `col BETWEEN a AND b`), with nothing else (no surrounding AND/OR).
+/// Mirrors `simple_equality` below, just for `<`/`<=`/`>`/`>=`/`BETWEEN`
+/// instead of `=`. Anything more complex falls back to a full scan; the
+/// WHERE clause is still re-applied in full afterwards either way, so this
+/// is purely an optimization and can never change the result set.
+fn simple_range(expr: &Expr, params: &[Value]) -> Option<(String, Bound<Value>, Bound<Value>)> {
+    let ctx = EvalCtx::no_row();
+    match expr {
+        Expr::BinaryOp { left, op, right } => {
+            let (col, val, flipped) = match (left.as_ref(), right.as_ref()) {
+                (Expr::Identifier(id), other) if !matches!(other, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) => {
+                    let mut idx = 0usize;
+                    (id.value.clone(), expr::eval(other, &ctx, params, &mut idx), false)
+                }
+                (other, Expr::Identifier(id)) if !matches!(other, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) => {
+                    let mut idx = 0usize;
+                    (id.value.clone(), expr::eval(other, &ctx, params, &mut idx), true)
+                }
+                _ => return None,
+            };
+            // Normalize so `op` always reads left-to-right as `col OP val`.
+            let op = if flipped {
+                match op {
+                    BinaryOperator::Lt => BinaryOperator::Gt,
+                    BinaryOperator::LtEq => BinaryOperator::GtEq,
+                    BinaryOperator::Gt => BinaryOperator::Lt,
+                    BinaryOperator::GtEq => BinaryOperator::LtEq,
+                    other => other.clone(),
+                }
+            } else {
+                op.clone()
+            };
+            match op {
+                BinaryOperator::Gt => Some((col, Bound::Excluded(val), Bound::Unbounded)),
+                BinaryOperator::GtEq => Some((col, Bound::Included(val), Bound::Unbounded)),
+                BinaryOperator::Lt => Some((col, Bound::Unbounded, Bound::Excluded(val))),
+                BinaryOperator::LtEq => Some((col, Bound::Unbounded, Bound::Included(val))),
+                _ => None,
+            }
+        }
+        Expr::Between { expr: inner, negated: false, low, high } => {
+            if let Expr::Identifier(id) = inner.as_ref() {
+                let mut idx_l = 0usize;
+                let mut idx_h = 0usize;
+                let lo = expr::eval(low, &ctx, params, &mut idx_l);
+                let hi = expr::eval(high, &ctx, params, &mut idx_h);
+                Some((id.value.clone(), Bound::Included(lo), Bound::Included(hi)))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Recognizes a WHERE clause that is *exactly* `col = <literal-or-param>`
@@ -340,6 +414,65 @@ fn row_col_any(row: &Row, name: &str) -> Option<Value> {
     row.get(name).cloned()
 }
 
+/// Recognizes a JOIN's `ON` condition as a plain equi-join between the two
+/// tables involved in *this* join (`t1.col1 = t2.col2`, qualified with
+/// either the table name or its alias, in either order) so the executor can
+/// build a hash index on one side instead of a nested-loop comparing every
+/// row of one side against every row of the other. Anything else (compound
+/// conditions, unqualified columns, non-equality, expressions) returns
+/// `None` and the caller falls back to the always-correct nested loop.
+///
+/// Only applied to the *first* join in a chain (see call site): from the
+/// second join onward, `name1`'s accumulated rows already carry columns
+/// from earlier tables too, and a qualified reference could belong to any
+/// of them, not just the immediate left-hand table - the nested-loop path
+/// (which resolves columns generically through `evaluate_where_ctx`)
+/// already handles that correctly, so it's left alone rather than special-
+/// cased further.
+fn extract_equi_join(constraint: &JoinConstraint, name1: &str, name2: &str) -> Option<(String, String)> {
+    let expr = match constraint {
+        JoinConstraint::On(expr) => expr,
+        _ => return None,
+    };
+    if let Expr::BinaryOp { left, op: BinaryOperator::Eq, right } = expr {
+        let side = |e: &Expr| -> Option<(u8, String)> {
+            match e {
+                Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+                    if parts[0].value == name1 {
+                        Some((1, parts[1].value.clone()))
+                    } else if parts[0].value == name2 {
+                        Some((2, parts[1].value.clone()))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        };
+        match (side(left), side(right)) {
+            (Some((1, c1)), Some((2, c2))) => Some((c1, c2)),
+            (Some((2, c2)), Some((1, c1))) => Some((c1, c2)),
+            _ => None,
+        }
+    } else {
+        None
+    }
+}
+
+/// Groups `rows2` by the (raw, unqualified) value of `col2`, keyed by a
+/// canonical string form of the `Value` so it can live in a plain
+/// `HashMap` (`Value` itself only implements `PartialEq`, not `Hash`,
+/// because of the `f64` variant).
+fn hash_by_column<'a>(rows2: &'a [Row], col2: &str) -> HashMap<String, Vec<&'a Row>> {
+    let mut map: HashMap<String, Vec<&Row>> = HashMap::new();
+    for r in rows2 {
+        if let Some(v) = r.get(col2) {
+            map.entry(crate::index::value_to_key_string(v)).or_default().push(r);
+        }
+    }
+    map
+}
+
 fn execute_joins(
     state: &KvsState,
     db_id: u32,
@@ -360,13 +493,22 @@ fn execute_joins(
         row
     }).collect();
 
-    for join in &from[0].joins {
+    for (join_idx, join) in from[0].joins.iter().enumerate() {
         let (table2, alias2) = parse_table_factor(&join.relation);
         let name2 = table_ref_name(&table2, &alias2);
         let store2 = state.get_table_store(db_id, &table2)
             .ok_or_else(|| SkvsError::Schema(format!("Table {} not found", table2)))?;
         let schema2 = state.get_schema(db_id, &table2);
         let rows2: Vec<Row> = store2.iter().map(|e| e.value().clone()).collect();
+        // Only safe on the first hop of the chain - see `extract_equi_join` doc comment.
+        let equi = if join_idx == 0 {
+            match &join.join_operator {
+                JoinOperator::Inner(c) | JoinOperator::LeftOuter(c) => extract_equi_join(c, &name1, &name2),
+                _ => None,
+            }
+        } else {
+            None
+        };
 
         let combine = |row1: &Row, row2: &Row| -> Row {
             let mut combined = row1.clone();
@@ -376,6 +518,25 @@ fn execute_joins(
 
         match &join.join_operator {
             JoinOperator::Inner(constraint) => {
+                if let Some((col1, col2)) = &equi {
+                    // Hash join: O(n + m) instead of O(n * m). Build the
+                    // smaller/probe side once, then a single hashmap lookup
+                    // per left-side row replaces scanning all of rows2.
+                    let by_val = hash_by_column(&rows2, col2);
+                    let q1 = qualified_name(&name1, col1);
+                    let mut new_result = Vec::with_capacity(result.len());
+                    for row1 in &result {
+                        if let Some(v1) = row1.get(&q1) {
+                            if let Some(matches) = by_val.get(&crate::index::value_to_key_string(v1)) {
+                                for row2 in matches {
+                                    new_result.push(combine(row1, row2));
+                                }
+                            }
+                        }
+                    }
+                    result = new_result;
+                    continue;
+                }
                 let mut new_result = Vec::new();
                 for row1 in &result {
                     for row2 in &rows2 {
@@ -388,6 +549,30 @@ fn execute_joins(
                 result = new_result;
             }
             JoinOperator::LeftOuter(constraint) => {
+                if let Some((col1, col2)) = &equi {
+                    let by_val = hash_by_column(&rows2, col2);
+                    let q1 = qualified_name(&name1, col1);
+                    let mut new_result = Vec::with_capacity(result.len());
+                    for row1 in &result {
+                        let matches = row1.get(&q1).and_then(|v1| by_val.get(&crate::index::value_to_key_string(v1)));
+                        match matches {
+                            Some(matches) if !matches.is_empty() => {
+                                for row2 in matches {
+                                    new_result.push(combine(row1, row2));
+                                }
+                            }
+                            _ => {
+                                let mut combined = row1.clone();
+                                for (k, v) in null_padded(&name2, &schema2, rows2.first()) {
+                                    combined.insert(k, v);
+                                }
+                                new_result.push(combined);
+                            }
+                        }
+                    }
+                    result = new_result;
+                    continue;
+                }
                 let mut new_result = Vec::new();
                 for row1 in &result {
                     let mut matched = false;
@@ -752,6 +937,44 @@ mod tests {
 
         let result = SqlEngine::execute(&state, 0, "SELECT a.id FROM a JOIN b ON a.id = b.a_id", &[], None).unwrap();
         assert_eq!(result.rows.len(), 1);
+    }
+
+    #[test]
+    fn range_query_uses_index_and_returns_correct_rows() {
+        // Regression/coverage test for the new BTreeMap range index: an
+        // indexed `>` predicate must return exactly the same rows a full
+        // scan would, not just "whatever the index fast path happens to
+        // fetch".
+        let state = new_state();
+        SqlEngine::execute(&state, 0, "CREATE TABLE t (id INTEGER, score INTEGER)", &[], None).unwrap();
+        SqlEngine::execute(&state, 0, "CREATE INDEX idx_score ON t (score)", &[], None).unwrap();
+        for (id, score) in [(1, 10), (2, 20), (3, 30), (4, 40)] {
+            SqlEngine::execute(&state, 0, &format!("INSERT INTO t (id, score) VALUES ({}, {})", id, score), &[], None).unwrap();
+        }
+        let result = SqlEngine::execute(&state, 0, "SELECT id FROM t WHERE score > 20", &[], None).unwrap();
+        let mut ids: Vec<i64> = result.rows.iter().filter_map(|r| match r.get("id") { Some(Value::Integer(i)) => Some(*i), _ => None }).collect();
+        ids.sort();
+        assert_eq!(ids, vec![3, 4]);
+
+        let between = SqlEngine::execute(&state, 0, "SELECT id FROM t WHERE score BETWEEN 20 AND 30", &[], None).unwrap();
+        let mut ids2: Vec<i64> = between.rows.iter().filter_map(|r| match r.get("id") { Some(Value::Integer(i)) => Some(*i), _ => None }).collect();
+        ids2.sort();
+        assert_eq!(ids2, vec![2, 3]);
+    }
+
+    #[test]
+    fn create_index_on_table_with_existing_rows_covers_them_immediately() {
+        // Regression test: CREATE INDEX used to only register the index in
+        // the schema without populating it from rows already in the table,
+        // so a lookup against it would incorrectly report zero matches
+        // until the next INSERT/UPDATE touched each row.
+        let state = new_state();
+        SqlEngine::execute(&state, 0, "CREATE TABLE t (id INTEGER, name TEXT)", &[], None).unwrap();
+        SqlEngine::execute(&state, 0, "INSERT INTO t (id, name) VALUES (1, 'pre-existing')", &[], None).unwrap();
+        SqlEngine::execute(&state, 0, "CREATE INDEX idx_name ON t (name)", &[], None).unwrap();
+
+        let result = SqlEngine::execute(&state, 0, "SELECT id FROM t WHERE name = 'pre-existing'", &[], None).unwrap();
+        assert_eq!(result.rows.len(), 1, "index must cover rows that existed before CREATE INDEX ran");
     }
 
     #[test]

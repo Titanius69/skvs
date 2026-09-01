@@ -1,20 +1,33 @@
 use dashmap::DashMap;
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use std::path::PathBuf;
 use crate::schema::*;
 use crate::fts::FtsVirtualTable;
 use crate::virtual_table::VirtualTableRegistry;
 use crate::transaction::TxnManager;
 use crate::error::SkvsError;
+use crate::index::IndexKey;
+
+/// One secondary index's in-memory data: an ordered map from indexed value
+/// to the row ids that have it, so both point lookups (`=`) and range
+/// lookups (`<`, `>`, `BETWEEN`) are O(log n) instead of a full table scan.
+pub type IndexStore = Arc<RwLock<BTreeMap<IndexKey, Vec<RowId>>>>;
 
 pub struct KvsState {
     // Core data
     pub dbs: DashMap<u32, Arc<DashMap<String, Arc<DashMap<RowId, Row>>>>>,
     pub schemas: DashMap<u32, Arc<DashMap<String, Arc<TableSchema>>>>,
-    pub rowid_generators: DashMap<u32, Arc<DashMap<String, u64>>>,
+    // Per (db, table) row-id counter. A plain `AtomicU64` rather than a
+    // DashMap-guarded `u64` so concurrent INSERTs into the *same* table
+    // never block each other on a shard lock just to bump a counter -
+    // `fetch_add` is a single lock-free CPU instruction.
+    pub rowid_generators: DashMap<u32, Arc<DashMap<String, AtomicU64>>>,
     pub db_name_to_id: HashMap<String, u32>,
     pub raw_stores: DashMap<u32, Arc<DashMap<String, Arc<DashMap<Vec<u8>, Vec<u8>>>>>>,
+    // Secondary indexes: db_id -> "table\0index_name" -> IndexStore.
+    pub indexes: DashMap<u32, Arc<DashMap<String, IndexStore>>>,
 
     // Triggers: db_id -> table_name -> Vec<Arc<TriggerDef>>
     pub triggers: DashMap<u32, Arc<DashMap<String, Vec<Arc<TriggerDef>>>>>,
@@ -45,6 +58,7 @@ impl KvsState {
         let schemas = DashMap::new();
         let rowid_gens = DashMap::new();
         let raw_stores = DashMap::new();
+        let indexes = DashMap::new();
         let triggers = DashMap::new();
         let views = DashMap::new();
         let fts_tables = DashMap::new();
@@ -56,6 +70,7 @@ impl KvsState {
             schemas.insert(db.id, Arc::new(DashMap::new()));
             rowid_gens.insert(db.id, Arc::new(DashMap::new()));
             raw_stores.insert(db.id, Arc::new(DashMap::new()));
+            indexes.insert(db.id, Arc::new(DashMap::new()));
             triggers.insert(db.id, Arc::new(DashMap::new()));
             views.insert(db.id, Arc::new(DashMap::new()));
             fts_tables.insert(db.id, Arc::new(DashMap::new()));
@@ -69,6 +84,7 @@ impl KvsState {
             rowid_generators: rowid_gens,
             db_name_to_id: name_map,
             raw_stores,
+            indexes,
             triggers,
             views,
             fts_tables,
@@ -95,10 +111,12 @@ impl KvsState {
 
     pub fn get_next_rowid(&self, db_id: u32, table: &str) -> u64 {
         let gens = self.rowid_generators.entry(db_id).or_insert_with(|| Arc::new(DashMap::new()));
-        let mut gen = gens.entry(table.to_string()).or_insert(1);
-        let id = *gen;
-        *gen += 1;
-        id
+        let gen = gens.entry(table.to_string()).or_insert_with(|| AtomicU64::new(1));
+        // A single lock-free fetch_add instead of the previous
+        // read-modify-write under the DashMap shard lock: concurrent
+        // INSERTs into the same table no longer serialize on this counter
+        // any more than the CPU's own atomic-add already requires.
+        gen.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Bumps the rowid generator for a table up to at least `min_next`, without ever
@@ -106,9 +124,21 @@ impl KvsState {
     /// with rowids that were just loaded from disk.
     pub fn set_min_next_rowid(&self, db_id: u32, table: &str, min_next: u64) {
         let gens = self.rowid_generators.entry(db_id).or_insert_with(|| Arc::new(DashMap::new()));
-        let mut gen = gens.entry(table.to_string()).or_insert(1);
-        if *gen < min_next {
-            *gen = min_next;
+        let gen = gens.entry(table.to_string()).or_insert_with(|| AtomicU64::new(1));
+        gen.fetch_max(min_next, Ordering::Relaxed);
+    }
+
+    // ---- Secondary indexes ----
+    pub fn get_or_create_index_store(&self, db_id: u32, table: &str, index_name: &str) -> IndexStore {
+        let db_indexes = self.indexes.entry(db_id).or_insert_with(|| Arc::new(DashMap::new())).clone();
+        let key = format!("{}\0{}", table, index_name);
+        let store = db_indexes.entry(key).or_insert_with(|| Arc::new(RwLock::new(BTreeMap::new()))).clone();
+        store
+    }
+
+    pub fn drop_index_store(&self, db_id: u32, table: &str, index_name: &str) {
+        if let Some(db_indexes) = self.indexes.get(&db_id) {
+            db_indexes.remove(&format!("{}\0{}", table, index_name));
         }
     }
 

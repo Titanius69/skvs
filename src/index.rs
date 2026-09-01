@@ -1,6 +1,8 @@
 use crate::error::SkvsError;
 use crate::schema::*;
-use crate::state::KvsState;
+use crate::state::{IndexStore, KvsState};
+use std::cmp::Ordering;
+use std::ops::Bound;
 
 /// The kind of change that happened to a row, used to keep secondary
 /// indexes in sync.
@@ -11,9 +13,31 @@ pub enum IndexOp {
     Update { old_row: Row },
 }
 
-const INDEX_TABLE: &str = "__indexes__";
+/// Total-order wrapper around `Value` so a secondary index can live in a
+/// `BTreeMap` (point *and* range lookups, both O(log n) instead of an O(n)
+/// scan) rather than the old scheme of bincode-blobbing a `Vec<RowId>` per
+/// distinct value into the raw key/value store. That old scheme meant every
+/// single index update - even flipping one row - deserialized and
+/// re-serialized the *entire* id list for that value, and a range predicate
+/// (`WHERE x > 10`, `BETWEEN`) couldn't use the index at all since the blob
+/// keys weren't ordered in any lookup-friendly way.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexKey(pub Value);
+impl Eq for IndexKey {}
+impl PartialOrd for IndexKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for IndexKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.compare(&other.0)
+    }
+}
 
-fn value_to_key_string(v: &Value) -> String {
+/// Canonical, type-distinguishing string form of a `Value`, used as a hash
+/// key by the SELECT-side hash-join fast path (see `sql/select.rs`).
+pub(crate) fn value_to_key_string(v: &Value) -> String {
     match v {
         Value::Null => "n:".to_string(),
         Value::Integer(i) => format!("i:{}", i),
@@ -23,50 +47,65 @@ fn value_to_key_string(v: &Value) -> String {
     }
 }
 
-fn index_key(table: &str, index_name: &str, value: &Value) -> Vec<u8> {
-    format!("{}:{}:{}", table, index_name, value_to_key_string(value)).into_bytes()
-}
-
 fn index_value(idx: &IndexDef, row: &Row) -> Option<Value> {
     // Only single-column indexes are supported for now.
     let col = idx.columns.first()?;
     row.get(col).cloned()
 }
 
-fn read_ids(state: &KvsState, db_id: u32, key: &[u8]) -> Vec<RowId> {
-    state
-        .get_raw(db_id, INDEX_TABLE, key)
-        .and_then(|bytes| bincode::deserialize::<Vec<RowId>>(&bytes).ok())
-        .unwrap_or_default()
-}
-
-fn write_ids(state: &KvsState, db_id: u32, key: Vec<u8>, ids: &[RowId]) {
-    if ids.is_empty() {
-        state.remove_raw(db_id, INDEX_TABLE, &key);
-        return;
-    }
-    if let Ok(bytes) = bincode::serialize(ids) {
-        state.put_raw(db_id, INDEX_TABLE, key, bytes);
-    }
+fn index_store(state: &KvsState, db_id: u32, table: &str, index_name: &str) -> IndexStore {
+    state.get_or_create_index_store(db_id, table, index_name)
 }
 
 fn add_to_index(state: &KvsState, db_id: u32, table: &str, idx: &IndexDef, row: &Row, rowid: RowId) {
     if let Some(val) = index_value(idx, row) {
-        let key = index_key(table, &idx.name, &val);
-        let mut ids = read_ids(state, db_id, &key);
+        let store = index_store(state, db_id, table, &idx.name);
+        let mut map = store.write().unwrap();
+        let ids = map.entry(IndexKey(val)).or_insert_with(Vec::new);
         if !ids.contains(&rowid) {
             ids.push(rowid);
         }
-        write_ids(state, db_id, key, &ids);
     }
 }
 
 fn remove_from_index(state: &KvsState, db_id: u32, table: &str, idx: &IndexDef, row: &Row, rowid: RowId) {
     if let Some(val) = index_value(idx, row) {
-        let key = index_key(table, &idx.name, &val);
-        let mut ids = read_ids(state, db_id, &key);
-        ids.retain(|r| *r != rowid);
-        write_ids(state, db_id, key, &ids);
+        let store = index_store(state, db_id, table, &idx.name);
+        let mut map = store.write().unwrap();
+        let key = IndexKey(val);
+        let mut now_empty = false;
+        if let Some(ids) = map.get_mut(&key) {
+            ids.retain(|r| *r != rowid);
+            now_empty = ids.is_empty();
+        }
+        if now_empty {
+            map.remove(&key);
+        }
+    }
+}
+
+/// Removes an index's whole in-memory BTreeMap (used by `DROP INDEX`).
+pub fn drop_index_store(state: &KvsState, db_id: u32, table: &str, index_name: &str) {
+    state.drop_index_store(db_id, table, index_name);
+}
+
+/// Rebuilds an index from the table's current live rows. Needed in two
+/// cases: (1) `CREATE INDEX` on a table that already has data - without
+/// this, the index silently covered zero of the existing rows and every
+/// lookup against it would incorrectly report "no match"; (2) restoring a
+/// snapshot after a restart, since only row content is persisted, not the
+/// in-memory index structure itself.
+pub fn rebuild_index(state: &KvsState, db_id: u32, table: &str, idx: &IndexDef) {
+    if let Some(rows) = state.get_table_store(db_id, table) {
+        let store = index_store(state, db_id, table, &idx.name);
+        let mut map = store.write().unwrap();
+        map.clear();
+        for entry in rows.iter() {
+            let rowid = *entry.key();
+            if let Some(val) = index_value(idx, entry.value()) {
+                map.entry(IndexKey(val)).or_insert_with(Vec::new).push(rowid);
+            }
+        }
     }
 }
 
@@ -108,9 +147,42 @@ pub fn update_indexes(
     Ok(())
 }
 
-/// Look up row ids for a given value using a named index. Useful for future
-/// query-planning work; not yet wired into the SQL executor.
+/// Equality point lookup (`WHERE col = value`) against a named index.
+/// O(log n) via the underlying `BTreeMap`.
 pub fn lookup_index(state: &KvsState, db_id: u32, table: &str, index_name: &str, value: &Value) -> Vec<RowId> {
-    let key = index_key(table, index_name, value);
-    read_ids(state, db_id, &key)
+    let store = index_store(state, db_id, table, index_name);
+    let map = store.read().unwrap();
+    map.get(&IndexKey(value.clone())).cloned().unwrap_or_default()
 }
+
+/// Range lookup against a named index: `lower`/`upper` follow
+/// `std::ops::Bound` semantics, so this one function covers `<`, `<=`, `>`,
+/// `>=`, and `BETWEEN` via a single `BTreeMap::range()` call instead of a
+/// full table scan.
+pub fn range_lookup(
+    state: &KvsState,
+    db_id: u32,
+    table: &str,
+    index_name: &str,
+    lower: Bound<Value>,
+    upper: Bound<Value>,
+) -> Vec<RowId> {
+    let store = index_store(state, db_id, table, index_name);
+    let map = store.read().unwrap();
+    let lower = match lower {
+        Bound::Included(v) => Bound::Included(IndexKey(v)),
+        Bound::Excluded(v) => Bound::Excluded(IndexKey(v)),
+        Bound::Unbounded => Bound::Unbounded,
+    };
+    let upper = match upper {
+        Bound::Included(v) => Bound::Included(IndexKey(v)),
+        Bound::Excluded(v) => Bound::Excluded(IndexKey(v)),
+        Bound::Unbounded => Bound::Unbounded,
+    };
+    let mut out = Vec::new();
+    for (_, ids) in map.range::<IndexKey, _>((lower, upper)) {
+        out.extend(ids.iter().copied());
+    }
+    out
+}
+

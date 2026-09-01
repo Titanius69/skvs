@@ -328,6 +328,16 @@ fn load_sql_snapshot(state: &KvsState, config: &Config) {
             // Ensure the next auto-generated rowid continues past whatever we just
             // restored, otherwise a fresh INSERT could overwrite a restored row.
             state.set_min_next_rowid(db_id, &table_name, max_rowid + 1);
+
+            // Secondary indexes are an in-memory-only structure (see
+            // `state::IndexStore`) - only row content is persisted - so
+            // every index defined on this table has to be rebuilt from the
+            // rows that were just restored above.
+            if let Some(schema) = schemas_map.get(&table_name) {
+                for idx in &schema.indices {
+                    crate::index::rebuild_index(state, db_id, &table_name, idx);
+                }
+            }
         }
 
         // Raw put()/get()/remove() key-value tables. Without this, every

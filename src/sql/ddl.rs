@@ -114,7 +114,7 @@ pub fn create_table(
     dbs.insert(table_name.clone(), Arc::new(DashMap::new()));
 
     let gens = state.rowid_generators.entry(db_id).or_insert_with(|| Arc::new(DashMap::new()));
-    gens.insert(table_name, 1);
+    gens.insert(table_name, std::sync::atomic::AtomicU64::new(1));
 
     Ok(QueryResult::empty())
 }
@@ -359,14 +359,21 @@ pub fn create_index(state: &KvsState, db_id: u32, stmt: &Statement) -> Result<Qu
 
     let col_names: Vec<String> = columns.iter().map(|c| c.expr.to_string()).collect();
     let mut new_schema = (*schema_arc).clone();
-    new_schema.indices.push(IndexDef {
+    let new_index = IndexDef {
         name: index_name,
         columns: col_names,
         unique,
         partial_where: None,
         is_expression: false,
-    });
-    schemas.insert(table, Arc::new(new_schema));
+    };
+    new_schema.indices.push(new_index.clone());
+    schemas.insert(table.clone(), Arc::new(new_schema));
+
+    // Without this, CREATE INDEX on a table that already has rows silently
+    // covered zero of them - the index existed in the schema but every
+    // lookup against it returned "no match" until the next INSERT touched
+    // each row. Populate it immediately from what's already there instead.
+    crate::index::rebuild_index(state, db_id, &table, &new_index);
 
     Ok(QueryResult::empty())
 }
@@ -383,14 +390,20 @@ pub fn drop_index(state: &KvsState, db_id: u32, stmt: &Statement) -> Result<Quer
     for name in names {
         let index_name = name.to_string();
         let mut found = false;
+        let mut dropped_from_table: Option<String> = None;
         for mut entry in schemas.iter_mut() {
             if entry.indices.iter().any(|i| i.name == index_name) {
                 let mut new_schema = (**entry.value()).clone();
                 new_schema.indices.retain(|i| i.name != index_name);
                 *entry.value_mut() = Arc::new(new_schema);
+                dropped_from_table = Some(entry.key().clone());
                 found = true;
                 break;
             }
+        }
+        if let Some(table) = dropped_from_table {
+            // Free the in-memory BTreeMap too, not just the schema entry.
+            crate::index::drop_index_store(state, db_id, &table, &index_name);
         }
         if !found && !if_exists {
             return Err(SkvsError::Schema(format!("Index {} not found", index_name)));
@@ -470,7 +483,7 @@ pub fn create_virtual_table(state: &KvsState, db_id: u32, stmt: &Statement) -> R
     dbs.insert(name.clone(), Arc::new(DashMap::new()));
 
     let gens = state.rowid_generators.entry(db_id).or_insert_with(|| Arc::new(DashMap::new()));
-    gens.insert(name.clone(), 1);
+    gens.insert(name.clone(), std::sync::atomic::AtomicU64::new(1));
 
     state.register_fts_table(db_id, &name, Arc::new(crate::fts::FtsVirtualTable::new(&name, &content_column)))?;
 

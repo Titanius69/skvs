@@ -88,14 +88,45 @@ app.post('/api/db/:dbName/query', async (req, res) => {
     return p; // numbers, strings, null and booleans pass straight through
   });
 
+  const httpStart = process.hrtime.bigint();
   try {
     const result = skvs.query(dbId, sql, rustParams, txId ?? null);
+    const httpUs = Number(process.hrtime.bigint() - httpStart) / 1000;
+
+    // The Rust side hands back a `timing` breakdown (params_us / engine_us /
+    // encode_us / total_us, see lib.rs::query) purely so this can be logged
+    // - it never affects the response body's shape otherwise. `httpUs` adds
+    // the one leg Rust can't see: the napi FFI call itself (JS args -> Rust,
+    // and the Rust JSON value -> JS object on the way back).
+    logQueryTiming(dbName, sql, result.timing, httpUs);
+
     res.json(result);
   } catch (err) {
     console.error('SQL error:', err);
     res.status(400).json({ error: err.message });
   }
 });
+
+/// Compact one-line-per-query timing log: `[skvs] db=... engine=...us ...`.
+/// `engine_us` is the number that matters for "is the database fast" -
+/// pure Rust parse+plan+execute with no serialization on either side of it.
+/// The others show where the rest of the request's time actually goes
+/// (params conversion, JSON encode, FFI/HTTP overhead), which is normally
+/// the bigger cost once the query itself is fast.
+function logQueryTiming(dbName, sql, timing, httpUs) {
+  const shortSql = sql.length > 60 ? sql.slice(0, 57) + '...' : sql;
+  if (!timing) {
+    console.log(`[skvs] db=${dbName} sql="${shortSql}" (no timing data returned)`);
+    return;
+  }
+  const fmt = (us) => `${us.toFixed(us < 10 ? 2 : 0)}us`;
+  console.log(
+    `[skvs] db=${dbName} sql="${shortSql}" ` +
+    `engine=${fmt(timing.engine_us)} params=${fmt(timing.params_us)} ` +
+    `encode=${fmt(timing.encode_us)} rust_total=${fmt(timing.total_us)} ` +
+    `ffi_http_overhead=${fmt(httpUs - timing.total_us)} http_total=${fmt(httpUs)}`
+  );
+}
 
 // Transactions: begin one here, thread the returned txId through the `txId`
 // field of subsequent /query calls (including BEGIN/COMMIT/ROLLBACK issued
